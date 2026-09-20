@@ -96,10 +96,16 @@ fn duration(s: &str) -> Result<i64> {
         Some('d') => (&s[..s.len() - 1], 86400),
         _ => (s, 1),
     };
-    Ok(num
+    let secs = num
         .parse::<i64>()
         .with_context(|| format!("duration {s}"))?
-        * mult)
+        * mult;
+    if secs <= 0 {
+        anyhow::bail!(
+            "duration {s} is not positive — a window of zero length makes every selector look dead"
+        );
+    }
+    Ok(secs)
 }
 
 fn real_main() -> Result<u8> {
@@ -211,5 +217,37 @@ mod tests {
         assert!(duration("banana").is_err());
         assert!(duration("").is_err());
         assert!(duration("d").is_err());
+        assert!(duration("soon").is_err());
+    }
+
+    /// `--long 7d` and `--short 15m` still resolve as before — the guard
+    /// below must not touch the ordinary, positive cases.
+    #[test]
+    fn seven_days_is_still_604800() {
+        assert_eq!(duration("7d").unwrap(), 604800);
+    }
+
+    #[test]
+    fn fifteen_minutes_is_still_900() {
+        assert_eq!(duration("15m").unwrap(), 900);
+    }
+
+    #[test]
+    fn bare_3600_is_still_3600() {
+        assert_eq!(duration("3600").unwrap(), 3600);
+    }
+
+    /// A ZERO-LENGTH WINDOW MUST BE REJECTED, NOT ACCEPTED AS ZERO SECONDS.
+    /// `--short 0` would make every selector look dead — a report of a
+    /// hundred dead rules that is entirely an artefact of the flag.
+    #[test]
+    fn zero_is_rejected_not_accepted() {
+        assert!(duration("0").is_err());
+    }
+
+    /// AN INVERTED WINDOW IS THE SAME CATASTROPHE FROM THE OTHER SIDE.
+    #[test]
+    fn a_negative_duration_is_rejected() {
+        assert!(duration("-5m").is_err());
     }
 }
