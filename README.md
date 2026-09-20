@@ -44,9 +44,18 @@ short (default 15 minutes), and one of three verdicts:
 
 | long window | short window | verdict | meaning |
 |---|---|---|---|
-| empty | — | **dead** | the series has never existed; the rule cannot fire |
+| empty | — | **dead** | nothing in the long window — the rule cannot fire. The series may never have existed, or may be older than the window |
 | hit | empty | **quiet** | a hint, not a failure — normal for a counter that only moves on an event |
 | hit | hit | **live** | active right now |
+
+A `dead` verdict says exactly this much: the selector matched nothing over
+the long window. Whether that is a wrong metric name, a wrong label value,
+or an event that simply has not happened recently is the triage step that
+follows, and crosshair does not decide it for you — the first real run found
+a selector absent over seven days whose series turned out to exist, just
+older (see below). The verdict itself stays right to report: a selector
+that has matched nothing in seven days is still worth a red exit, whatever
+the reason turns out to be.
 
 This also spares a hand-written exception for every `absent()` rule in this
 household's alert file: their metrics exist in normal operation too, or the
