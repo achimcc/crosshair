@@ -77,9 +77,35 @@ fn audit_spur_ohne_deploy_names_two_streams_and_repeats_neither() {
 // the skip note as `SKIPPED: ...` so it cannot be mistaken for a pass, and
 // adding `CROSSHAIR_RULES_REQUIRED=1` below to turn the skip into a hard
 // failure on a machine where the file is known to exist.
+//
+// THE DEFAULT DIRECTORY IS THE MAIN CHECKOUT, NOT A WORKTREE — found in
+// review round 3 (2026-09-20). An earlier version pointed at
+// `~/Projects/homeserver/.claude/worktrees/leakwatch/...`, a SCRATCH git
+// worktree made for one piece of work. That worktree is deleted once its
+// branch is done; on that day both tests below would start skipping —
+// quietly, forever, on the very machine where they are meant to mean
+// something. A loud skip that never triggers because the path never exists
+// again is the same failure as a silent one, just delayed. The default is
+// therefore `~/Projects/homeserver/hosts/server/gaeste`, the long-lived main
+// checkout. It is still just a guess about the reader's machine — a
+// hard-coded home directory has no business being load-bearing in a public
+// repository — so `CROSSHAIR_RULES_DIR` overrides it: set it to point at
+// any checkout's `hosts/server/gaeste` and both tests read from there.
 
-const OBS_REGELN: &str = "/home/achim/Projects/homeserver/.claude/worktrees/leakwatch/hosts/server/gaeste/obs-regeln.yml";
-const LOKI_REGELN: &str = "/home/achim/Projects/homeserver/.claude/worktrees/leakwatch/hosts/server/gaeste/loki-regeln.yml";
+/// The directory holding `obs-regeln.yml` and `loki-regeln.yml`: the value
+/// of `CROSSHAIR_RULES_DIR` if set, otherwise the main homeserver checkout.
+fn rules_dir() -> String {
+    std::env::var("CROSSHAIR_RULES_DIR")
+        .unwrap_or_else(|_| "/home/achim/Projects/homeserver/hosts/server/gaeste".to_string())
+}
+
+fn obs_regeln_path() -> String {
+    format!("{}/obs-regeln.yml", rules_dir())
+}
+
+fn loki_regeln_path() -> String {
+    format!("{}/loki-regeln.yml", rules_dir())
+}
 
 /// Reads `path`, or explains why the caller must return early — loudly.
 ///
@@ -138,7 +164,7 @@ fn a_missing_rule_file_skips_without_the_required_env_var() {
 #[test]
 #[ignore = "reads a file outside this repo; run with --ignored --nocapture"]
 fn obs_regeln_yml_matches_the_2026_09_20_measurement() {
-    let Some(text) = read_rule_file_or_skip(OBS_REGELN) else {
+    let Some(text) = read_rule_file_or_skip(&obs_regeln_path()) else {
         return;
     };
 
@@ -202,7 +228,7 @@ fn obs_regeln_yml_matches_the_2026_09_20_measurement() {
 #[test]
 #[ignore = "reads a file outside this repo; run with --ignored --nocapture"]
 fn loki_regeln_yml_matches_the_2026_09_20_measurement() {
-    let Some(text) = read_rule_file_or_skip(LOKI_REGELN) else {
+    let Some(text) = read_rule_file_or_skip(&loki_regeln_path()) else {
         return;
     };
 
