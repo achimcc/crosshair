@@ -1,6 +1,9 @@
 //! Real expressions from the homeserver repo. Measured on 2026-09-20: 72 rules
-//! in obs-regeln.yml parse without a single error, 101 selectors, 16 rules with
-//! more than one, exactly one rule without any (`Watchdog: vector(1)`).
+//! in obs-regeln.yml parse without a single error, 95 distinct selectors, 15
+//! rules with more than one, exactly one rule without any (`Watchdog: vector(1)`).
+//! (An earlier throwaway probe reported 101/16 by counting every selector
+//! *occurrence* rather than deduplicating within one expression — see the
+//! comment on `obs_regeln_yml_matches_the_2026_09_20_measurement` below.)
 
 use crosshair::{logql, promql};
 
@@ -59,28 +62,25 @@ fn audit_spur_ohne_deploy_names_two_streams_and_repeats_neither() {
 const OBS_REGELN: &str = "/home/achim/Projects/homeserver/.claude/worktrees/leakwatch/hosts/server/gaeste/obs-regeln.yml";
 const LOKI_REGELN: &str = "/home/achim/Projects/homeserver/.claude/worktrees/leakwatch/hosts/server/gaeste/loki-regeln.yml";
 
-/// Measured 2026-09-20 with a throwaway program: 72 rules, 0 parse errors,
-/// 101 selectors total, 16 rules with more than one, exactly 1 rule with
-/// none (`Watchdog: vector(1)`). This test re-measures with the finished
-/// extractor so a change to `promql::selectors` cannot drift away from that
-/// count unnoticed.
-///
-/// AS OF 2026-09-20 THIS TEST DOES NOT PASS, AND THE ASSERTION IS LEFT AS
-/// MEASURED RATHER THAN QUIETLY LOWERED — see task-11a-report.md. The finished
-/// extractor gives 95/15 here, not 101/16, and the difference is fully
-/// explained: `promql::selectors` dedups repeats WITHIN one rule (its own
-/// doc comment and the `duplicates_within_one_expression_collapse` unit test
-/// say so on purpose — the same design point as
-/// `the_absent_shape_that_must_not_need_an_exception` above, which pins this
-/// exact behaviour for the real rule `InsistNichtErreichbar`). The 2026-09-20
-/// throwaway program counted raw AST occurrences instead, with no in-rule
-/// dedup (confirmed: summing occurrences without the `contains()` check
-/// yields exactly 101). Four rules carry the six-selector gap:
-/// `InsistNichtErreichbar` (2 -> 1, the one rule that leaves the ">1"
-/// bucket), `RustsecNeueMeldung` (3 -> 2), `ProwlarrIndexerFailing` (3 -> 2),
-/// `ArrNoImports` (9 -> 6). This looks like the design measurement predating
-/// the dedup decision, not a bug in the finished extractor — but that is the
-/// controller's call, not this test's.
+// MEASURED 2026-09-20, corrected 2026-09-20 after the first real run of
+// this test: 72 rules, 0 parse errors, 95 DISTINCT selectors, 15 rules
+// with more than one, exactly one rule with none (`Watchdog: vector(1)`).
+//
+// The design notes say 101 and 16. Those count OCCURRENCES: the throwaway
+// probe that produced them pushed every vector selector it visited, while
+// `promql::selectors` collapses repeats within one expression — which is
+// the documented behaviour and has its own test
+// (`duplicates_within_one_expression_collapse` in `src/promql.rs`), and the
+// same design point as `the_absent_shape_that_must_not_need_an_exception`
+// above, which pins this exact behaviour for the real rule
+// `InsistNichtErreichbar`. Four rules carry the difference, each naming the
+// same selector twice or more within one expression: `InsistNichtErreichbar`
+// (2 occurrences -> 1 distinct, the one rule that leaves the ">1" bucket),
+// `RustsecNeueMeldung` (3 -> 2, `rustsec_meldung` named twice — once plain,
+// once with `offset 2d`), `ProwlarrIndexerFailing` (3 -> 2), `ArrNoImports`
+// (9 -> 6). 95 is the number that costs something: it is how many series
+// queries a run actually puts to Prometheus, which is what the cache in
+// `run()` is for.
 #[test]
 #[ignore = "reads a file outside this repo; run with --ignored"]
 fn obs_regeln_yml_matches_the_2026_09_20_measurement() {
@@ -130,12 +130,12 @@ fn obs_regeln_yml_matches_the_2026_09_20_measurement() {
         "a PromQL expression in obs-regeln.yml no longer parses"
     );
     assert_eq!(
-        total_selectors, 101,
-        "total selector count drifted from the 2026-09-20 measurement"
+        total_selectors, 95,
+        "total distinct selector count drifted from the 2026-09-20 measurement"
     );
     assert_eq!(
-        more_than_one, 16,
-        "count of rules with more than one selector drifted"
+        more_than_one, 15,
+        "count of rules with more than one distinct selector drifted"
     );
     assert_eq!(
         none_at_all, 1,
