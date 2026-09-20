@@ -24,9 +24,14 @@ fn the_absent_shape_that_must_not_need_an_exception() {
     assert_eq!(s, vec![r#"up{job="insist"}"#]);
 }
 
+/// The threshold is `900`, matching `GastSpeicherSensorVeraltet` at
+/// `hosts/server/gaeste/obs-regeln.yml:213` exactly (verified 2026-09-20,
+/// review round 2 — an earlier draft carried `1800`, a value that belongs to
+/// a different rule; the point of this file is that the frozen text is the
+/// shipped text, so it had to be corrected against the source, not guessed).
 #[test]
 fn the_textfile_freshness_shape_with_its_escaped_regex() {
-    let src = r#"time() - node_textfile_mtime_seconds{file=~".*/gast-speicher\\.prom"} > 1800"#;
+    let src = r#"time() - node_textfile_mtime_seconds{file=~".*/gast-speicher\\.prom"} > 900"#;
     let s = promql::selectors(src).unwrap();
     assert_eq!(s.len(), 1);
     assert_eq!(
@@ -57,10 +62,59 @@ fn audit_spur_ohne_deploy_names_two_streams_and_repeats_neither() {
 // The path lives OUTSIDE this repo (a sibling checkout of the homeserver
 // monorepo) — a clone of crosshair anywhere else has no such neighbour. Both
 // tests below skip with a printed note rather than fail when the file is
-// missing; run them explicitly with `cargo test --test rules -- --ignored`.
+// missing; run them explicitly with
+// `cargo test --test rules -- --ignored --nocapture`.
+//
+// THE `--nocapture` IS NOT OPTIONAL, AND THIS IS THE TRAP TO REMEMBER:
+// libtest swallows the captured stdout/stderr of a PASSING test. A skip
+// path that returns `Ok` after `eprintln!`-ing a note is indistinguishable,
+// without `--nocapture`, from a run that read the file and verified the
+// measurement — `cargo test --test rules -- --ignored` alone prints
+// nothing but `ok` either way. That is exactly the failure mode this whole
+// tool exists to catch elsewhere: a green result that means "I did not
+// look". Found in review round 2 (2026-09-20); fixed by requiring
+// `--nocapture` in every place this file documents the invocation, wording
+// the skip note as `SKIPPED: ...` so it cannot be mistaken for a pass, and
+// adding `CROSSHAIR_RULES_REQUIRED=1` below to turn the skip into a hard
+// failure on a machine where the file is known to exist.
 
 const OBS_REGELN: &str = "/home/achim/Projects/homeserver/.claude/worktrees/leakwatch/hosts/server/gaeste/obs-regeln.yml";
 const LOKI_REGELN: &str = "/home/achim/Projects/homeserver/.claude/worktrees/leakwatch/hosts/server/gaeste/loki-regeln.yml";
+
+/// Reads `path`, or explains why the caller must return early — loudly.
+///
+/// With `CROSSHAIR_RULES_REQUIRED` set, a missing file is a **failure**, not
+/// a skip: use that on a machine where the monitoring repo is known to sit
+/// next door (this checkout, CI for this pairing, ...) so the measurement
+/// cannot go silently unverified. Without it, a bare `cargo test` from
+/// anywhere else stays green, but only when run with `--nocapture` does the
+/// note actually reach the screen — see the module comment above.
+fn read_rule_file_or_skip(path: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) => {
+            let note = format!(
+                "SKIPPED: {path} not found ({e}) — this machine has no monitoring \
+                 repo next door, so the 2026-09-20 measurement was NOT verified."
+            );
+            if std::env::var_os("CROSSHAIR_RULES_REQUIRED").is_some() {
+                panic!("{note} CROSSHAIR_RULES_REQUIRED is set — treating this as a failure.");
+            }
+            eprintln!("{note}");
+            None
+        }
+    }
+}
+
+/// This one runs by default (not `#[ignore]`d, no env var touched) so the
+/// skip half of `read_rule_file_or_skip` is exercised on every plain
+/// `cargo test`, on a machine with or without the monitoring repo. It does
+/// not assert on captured output — libtest's own capturing is the exact
+/// thing Finding 1 was about — only on the `None` contract.
+#[test]
+fn a_missing_rule_file_skips_without_the_required_env_var() {
+    assert!(read_rule_file_or_skip("/no/such/path/crosshair-test-probe.yml").is_none());
+}
 
 // MEASURED 2026-09-20, corrected 2026-09-20 after the first real run of
 // this test: 72 rules, 0 parse errors, 95 DISTINCT selectors, 15 rules
@@ -82,10 +136,9 @@ const LOKI_REGELN: &str = "/home/achim/Projects/homeserver/.claude/worktrees/lea
 // queries a run actually puts to Prometheus, which is what the cache in
 // `run()` is for.
 #[test]
-#[ignore = "reads a file outside this repo; run with --ignored"]
+#[ignore = "reads a file outside this repo; run with --ignored --nocapture"]
 fn obs_regeln_yml_matches_the_2026_09_20_measurement() {
-    let Ok(text) = std::fs::read_to_string(OBS_REGELN) else {
-        eprintln!("skip: {OBS_REGELN} not present — no monitoring repo next to this checkout");
+    let Some(text) = read_rule_file_or_skip(OBS_REGELN) else {
         return;
     };
 
@@ -147,10 +200,9 @@ fn obs_regeln_yml_matches_the_2026_09_20_measurement() {
 /// `{…}` brace block, one carries two and one carries three — and after
 /// dedup every rule has exactly one DISTINCT stream selector.
 #[test]
-#[ignore = "reads a file outside this repo; run with --ignored"]
+#[ignore = "reads a file outside this repo; run with --ignored --nocapture"]
 fn loki_regeln_yml_matches_the_2026_09_20_measurement() {
-    let Ok(text) = std::fs::read_to_string(LOKI_REGELN) else {
-        eprintln!("skip: {LOKI_REGELN} not present — no monitoring repo next to this checkout");
+    let Some(text) = read_rule_file_or_skip(LOKI_REGELN) else {
         return;
     };
 
