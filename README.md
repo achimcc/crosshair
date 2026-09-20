@@ -82,9 +82,24 @@ never actually reached.
 |---|---|
 | `0` | nothing dead, both controls on every source came back right |
 | `1` | at least one dead selector, or an expression the instance refuses to evaluate |
-| `2` | tool failure — a control failed, an API did not answer, an expression did not parse, or an exception matched nothing any more |
+| `2` | tool failure — a control failed, an API did not answer, an inventory was empty, an expression did not parse, an exception matched nothing any more, or the run checked no selector at all |
 
 `quiet` never changes the exit code by itself. It is printed, not alarmed on.
+
+Three of those exit-2 cases were added in 0.1.1, and they are all the same
+kind of thing — a run that produced no verdict used to produce a clean bill
+of health instead:
+
+- **An empty inventory.** A Prometheus with no rule loaded, or a Grafana
+  whose search returns no dashboard, is not a green run. It is an empty one,
+  and it now says so. (An empty Loki rule file always did.)
+- **A run that checked nothing.** If no source produced a single check and
+  nothing failed, the run says nothing about the rules and exits 2 rather
+  than printing "Every selector points at series that exist."
+- **The Grafana source runs Prometheus' control too.** Its panel verdicts
+  come from `/api/v1/series` against Prometheus, not from Grafana, so
+  Grafana's own control does not cover them. It is skipped when the
+  Prometheus source already ran it in the same run.
 
 ## Usage
 
@@ -99,13 +114,22 @@ OPTIONS:
         --grafana URL        default http://127.0.0.1:3000
         --grafana-password-file PATH
         --via-ssh TARGET     reach prometheus and loki through ssh + curl
-        --source LIST        prometheus,loki,grafana (default: all three)
+        --source LIST        prometheus,loki,grafana (default: all three);
+                             an unknown name is an error, never a no-op
         --long DURATION      long window, default 7d
         --short DURATION     short window, default 15m
     -c, --config FILE        exceptions, each needs a reason
     -h, --help
     -V, --version
 ```
+
+`--source` takes only those three names, and since 0.1.1 an unknown one is
+refused by name. Before that, `--source promethues` ran not a single check,
+produced an empty result and exited 0 under the line "Every selector points
+at series that exist." — this tool's own failure mode, one level up. A
+narrowed run also skips the exception file's staleness check and says so:
+that check asks the whole file, and an entry scoped to a source this run
+never visited would look unused without being it.
 
 Prometheus and Loki commonly listen on an address the workstation running
 crosshair cannot reach directly; `--via-ssh` wraps the same `curl` calls in
@@ -129,7 +153,12 @@ $ crosshair check \
 Same pattern as `unit-lint.toml` and `leakwatch.toml`: every entry names a
 scope (a `rule` by name, or a `dashboard` optionally narrowed to one
 `panel`), optionally one `selector` inside that scope, and a mandatory
-`reason`. An entry without a reason fails to parse. An entry that matches
+`reason`. An entry without a reason fails to parse; so does one that names
+both a `rule` and a `dashboard`, or a `rule` and a `panel` — `panel` narrows
+a `dashboard` and nothing else, and next to a `rule` it used to be accepted
+and then ignored, quietly widening the entry to every dead selector of that
+rule. `selector` is compared as an exact string: there is no prefix, glob or
+regular-expression matching, so one entry excepts one selector. An entry that matches
 nothing any more — the exception outlived what it excepted — turns the run
 red instead of aging silently:
 

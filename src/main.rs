@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use crosshair::config::Config;
 use crosshair::http::Curl;
 use crosshair::report;
-use crosshair::run::{Settings, run};
+use crosshair::run::{SOURCES, Settings, run};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -27,7 +27,8 @@ OPTIONS:
         --grafana URL        default http://127.0.0.1:3000
         --grafana-password-file PATH
         --via-ssh TARGET     reach prometheus and loki through ssh + curl
-        --source LIST        prometheus,loki,grafana (default: all three)
+        --source LIST        prometheus,loki,grafana (default: all three);
+                             an unknown name is an error, never a silent no-op
         --long DURATION      long window, default 7d
         --short DURATION     short window, default 15m
     -c, --config FILE        exceptions, each needs a reason
@@ -37,8 +38,9 @@ OPTIONS:
 EXIT STATUS:
     0  nothing dead, both controls right
     1  at least one dead selector, or an expression the instance refuses
-    2  tool failure — a control failed, an API did not answer, an expression
-       did not parse, or an exception matched nothing
+    2  tool failure — a control failed, an API did not answer, an inventory
+       was empty, an expression did not parse, an exception matched nothing,
+       or the run checked no selector at all
 ";
 
 #[derive(Default)]
@@ -87,6 +89,51 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
     Ok(Some(a))
 }
 
+/// `prometheus,loki` — the sources to run, and AN UNKNOWN NAME IS AN ERROR.
+///
+/// Until 0.1.1 the list went through unchecked and `run()` matched it with
+/// `any(|x| x == "prometheus")`: `--source promethues` ran nothing, produced
+/// an empty outcome, exited 0 and printed "Every selector points at series
+/// that exist." A tool built to tell "nothing is wrong" apart from "nothing
+/// was asked" must not fall for it itself.
+fn parse_sources(list: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = list
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let valid = SOURCES.join(", ");
+    if names.is_empty() {
+        return Err(format!(
+            "--source names no source at all (valid: {valid}) — an empty list checks nothing"
+        ));
+    }
+    for n in &names {
+        if !SOURCES.contains(&n.as_str()) {
+            return Err(format!("--source: unknown source {n:?} (valid: {valid})"));
+        }
+    }
+    Ok(names)
+}
+
+/// The cookie jar for Grafana's session, CREATED HERE AND NOT BY CURL.
+///
+/// curl creates it under whatever umask is in effect — 0644 in a default
+/// login shell — under a name that can be guessed from the process id, in a
+/// directory everyone may write to. `create_new` on top of the mode: a file
+/// that is already there gets a loud error rather than a write through
+/// whatever it turns out to be.
+fn create_cookie_jar(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating the cookie jar {}", path.display()))?;
+    Ok(())
+}
+
 /// `7d`, `90m`, `3600` — seconds out.
 fn duration(s: &str) -> Result<i64> {
     let (num, mult) = match s.chars().last() {
@@ -114,6 +161,14 @@ fn real_main() -> Result<u8> {
         print!("{HELP}");
         return Ok(2);
     }
+    // BEFORE ANY FILE IS READ AND ANY SECRET DECRYPTED. Checked here and not
+    // inside `parse_args` for one reason, and it is visible in the output:
+    // `lexopt::Error::Custom` is its own `source()`, so anyhow's `{:#}`
+    // printed the whole sentence twice.
+    let sources = match &a.sources {
+        Some(list) => parse_sources(list).map_err(anyhow::Error::msg)?,
+        None => SOURCES.iter().map(|s| s.to_string()).collect(),
+    };
     let cfg: Config = match &a.config {
         Some(p) => toml::from_str(
             &std::fs::read_to_string(p).with_context(|| format!("{}", p.display()))?,
@@ -140,12 +195,7 @@ fn real_main() -> Result<u8> {
         loki_rules: a.loki_rules,
         grafana: a.grafana.unwrap_or_else(|| "http://127.0.0.1:3000".into()),
         grafana_password: password,
-        sources: a
-            .sources
-            .unwrap_or_else(|| "prometheus,loki,grafana".into())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect(),
+        sources,
         long_secs: duration(a.long.as_deref().unwrap_or("7d"))?,
         short_secs: duration(a.short.as_deref().unwrap_or("15m"))?,
         now: std::time::SystemTime::now()
@@ -159,7 +209,17 @@ fn real_main() -> Result<u8> {
         via_ssh: a.via_ssh.clone(),
         cookie_jar: None,
     };
-    let jar = std::env::temp_dir().join(format!("crosshair-{}.cookies", std::process::id()));
+    // The nanoseconds are not decoration: with the pid alone a crashed run
+    // leaves a jar behind that `create_new` would then refuse for the next
+    // run that happens to get the same pid.
+    let jar = std::env::temp_dir().join(format!(
+        "crosshair-{}-{}.cookies",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .subsec_nanos()
+    ));
+    create_cookie_jar(&jar)?;
     let grafana_net = Curl {
         via_ssh: None,
         cookie_jar: Some(jar.clone()),
@@ -249,5 +309,74 @@ mod tests {
     #[test]
     fn a_negative_duration_is_rejected() {
         assert!(duration("-5m").is_err());
+    }
+
+    /// THE WHOLE POINT OF THE FLAG IS THAT IT SELECTS; A NAME NOBODY KNOWS
+    /// SELECTS NOTHING. `--source promethues` used to run not a single check,
+    /// produce an empty outcome, exit 0 and print "Every selector points at
+    /// series that exist." -- this tool's own failure mode, one level up.
+    #[test]
+    fn an_unknown_source_is_an_error() {
+        let e = parse_sources("promethues").unwrap_err();
+        assert!(e.contains("promethues"), "the message must name it: {e}");
+        assert!(e.contains("prometheus"), "and list the valid ones: {e}");
+    }
+
+    /// One good name does not launder a bad one next to it.
+    #[test]
+    fn an_unknown_source_beside_a_known_one_is_still_an_error() {
+        assert!(parse_sources("prometheus,grafna").is_err());
+    }
+
+    /// An empty list is not "all of them", it is a typo: `--source ""` or
+    /// `--source ,` would otherwise check nothing and report success.
+    #[test]
+    fn an_empty_source_list_is_an_error() {
+        assert!(parse_sources("").is_err());
+        assert!(parse_sources(",").is_err());
+        assert!(parse_sources("   ").is_err());
+    }
+
+    #[test]
+    fn the_three_known_sources_are_accepted() {
+        assert_eq!(parse_sources("prometheus").unwrap(), vec!["prometheus"]);
+        assert_eq!(
+            parse_sources(" loki , grafana ").unwrap(),
+            vec!["loki", "grafana"]
+        );
+        assert_eq!(parse_sources("prometheus,loki,grafana").unwrap().len(), 3);
+    }
+
+    /// THE JAR CARRIES A GRAFANA SESSION COOKIE and lands in a directory
+    /// everyone can write to. Left to curl it would be created under whatever
+    /// umask happens to be in effect -- 0644 on a default login shell.
+    #[test]
+    fn the_cookie_jar_is_created_unreadable_to_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let p =
+            std::env::temp_dir().join(format!("crosshair-jar-mode-{}.cookies", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        create_cookie_jar(&p).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            mode, 0o600,
+            "the cookie jar is readable by others: {mode:o}"
+        );
+    }
+
+    /// And it refuses a file that is already there rather than writing through
+    /// whatever it is -- a symlink planted under a predictable name is the
+    /// classic temp-file trap.
+    #[test]
+    fn an_existing_jar_is_refused_not_overwritten() {
+        let p = std::env::temp_dir().join(format!(
+            "crosshair-jar-exists-{}.cookies",
+            std::process::id()
+        ));
+        std::fs::write(&p, "").unwrap();
+        let r = create_cookie_jar(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(r.is_err(), "an existing jar must not be reused");
     }
 }

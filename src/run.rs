@@ -14,6 +14,10 @@ use crate::{logql, promql};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// The sources this tool knows, and the only names `--source` accepts.
+/// `main.rs` validates against this list; `run()` matches against it.
+pub const SOURCES: [&str; 3] = ["prometheus", "loki", "grafana"];
+
 pub struct Settings {
     pub prometheus: String,
     pub loki: String,
@@ -60,14 +64,23 @@ pub fn run(s: &Settings, cfg: &Config, net: &dyn Http, grafana_net: &dyn Http) -
     let long = s.now - s.long_secs;
     let short = s.now - s.short_secs;
 
+    let mut prometheus_control_passed = false;
     if s.sources.iter().any(|x| x == "prometheus") {
-        prometheus_source(s, &mut o, net, long, short);
+        prometheus_control_passed = prometheus_source(s, &mut o, net, long, short);
     }
     if s.sources.iter().any(|x| x == "loki") {
         loki_source(s, &mut o, net, long, short);
     }
     if s.sources.iter().any(|x| x == "grafana") {
-        grafana_source(s, &mut o, grafana_net, long, short, net);
+        grafana_source(
+            s,
+            &mut o,
+            grafana_net,
+            long,
+            short,
+            net,
+            prometheus_control_passed,
+        );
     }
 
     // Exceptions last: they can only mark what the run actually found.
@@ -76,40 +89,79 @@ pub fn run(s: &Settings, cfg: &Config, net: &dyn Http, grafana_net: &dyn Http) -
             c.excepted = true;
         }
     }
-    let dead: Vec<Check> = o
-        .checks
-        .iter()
-        .filter(|c| c.verdict == Verdict::Dead)
-        .cloned()
-        .collect();
-    for u in cfg.unused(&dead) {
-        o.tool_failures
-            .push(format!("exception matched nothing any more: {u}"));
+    // THE STALENESS CHECK NEEDS A FULL RUN. It asks the whole file whether
+    // every entry still suppressed something — and a narrowed run never even
+    // looked at the rules and panels the other sources own. With
+    // `--source loki` the first non-`optional` entry scoped to a Prometheus
+    // rule would turn every such run into an exit 2 for no reason at all.
+    if s.sources.len() < SOURCES.len() {
+        o.notes.push(format!(
+            "the staleness check over the exception file was skipped: this run looked at {} of {} sources, and an entry scoped to one of the others would look unused without being it",
+            s.sources.len(),
+            SOURCES.len()
+        ));
+    } else {
+        let dead: Vec<Check> = o
+            .checks
+            .iter()
+            .filter(|c| c.verdict == Verdict::Dead)
+            .cloned()
+            .collect();
+        for u in cfg.unused(&dead) {
+            o.tool_failures
+                .push(format!("exception matched nothing any more: {u}"));
+        }
+    }
+
+    // THE BACKSTOP UNDER EVERY OTHER GUARD: a run that produced not one
+    // check and not one failure has said nothing, and an empty `Outcome`
+    // otherwise exits 0 with "Every selector points at series that exist."
+    // `--source` is validated in `main`, so the known way in is closed — this
+    // catches the ones nobody has thought of yet.
+    //
+    // A finding counts as having looked: an expression the instance refuses
+    // IS a statement about a rule, and turning that exit 1 into an exit 2
+    // would bury it under a complaint about the run.
+    if o.checks.is_empty() && o.findings.is_empty() && o.tool_failures.is_empty() {
+        o.tool_failures.push(
+            "this run checked not a single selector — it looked at nothing and says nothing about the rules".into(),
+        );
     }
     o
 }
 
-fn prometheus_source(s: &Settings, o: &mut Outcome, net: &dyn Http, long: i64, short: i64) {
+/// Returns whether the positive control passed — the Grafana source needs
+/// the same answer and must not pay for it twice.
+fn prometheus_source(s: &Settings, o: &mut Outcome, net: &dyn Http, long: i64, short: i64) -> bool {
     let p = Prometheus {
         http: net,
         base: s.prometheus.clone(),
     };
     if let Err(e) = p.control(long, s.now) {
         o.tool_failures.push(format!("prometheus {e}"));
-        return;
+        return false;
     }
     let rules = match p.rules() {
         Ok(r) => r,
         Err(e) => {
             o.tool_failures.push(format!("prometheus rules: {e}"));
-            return;
+            return true;
         }
     };
-    // One question per distinct selector, not per rule: 101 selectors in this
-    // repo, many of them shared.
+    // One question per distinct selector, not per rule: 95 distinct selectors
+    // in this repo out of 101 occurrences, many of them shared between rules.
     let mut cache: HashMap<String, (usize, usize)> = HashMap::new();
     for r in rules {
-        if r.health != "ok" && !r.health.is_empty() {
+        // `unknown` IS NOT A FINDING. Prometheus reports it for a rule it has
+        // loaded but not yet evaluated, and `scripts/wartung.sh` runs
+        // crosshair right after a deploy that restarts obs-01 — a rule that
+        // is merely young would abort the maintenance window on exit 1.
+        if r.health == "unknown" {
+            o.notes.push(format!(
+                "{}: prometheus has loaded it but not evaluated it yet (health unknown)",
+                r.name
+            ));
+        } else if r.health != "ok" && !r.health.is_empty() {
             o.findings.push(format!(
                 "{} is unhealthy in prometheus ({}): {}",
                 r.name, r.health, r.last_error
@@ -155,6 +207,7 @@ fn prometheus_source(s: &Settings, o: &mut Outcome, net: &dyn Http, long: i64, s
             });
         }
     }
+    true
 }
 
 fn loki_source(s: &Settings, o: &mut Outcome, net: &dyn Http, long: i64, short: i64) {
@@ -233,6 +286,7 @@ fn loki_source(s: &Settings, o: &mut Outcome, net: &dyn Http, long: i64, short: 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn grafana_source(
     s: &Settings,
     o: &mut Outcome,
@@ -240,6 +294,7 @@ fn grafana_source(
     long: i64,
     short: i64,
     prom_net: &dyn Http,
+    prometheus_control_passed: bool,
 ) {
     let g = Grafana {
         http: net,
@@ -255,16 +310,30 @@ fn grafana_source(
         o.tool_failures.push(format!("grafana: {e}"));
         return;
     }
+    let p = Prometheus {
+        http: prom_net,
+        base: s.prometheus.clone(),
+    };
+    // THIS SOURCE HAS TWO LEGS AND §6 WANTS A CONTROL BEFORE EACH. Grafana's
+    // own control covers the `/api/ds/query` leg; every panel VERDICT below
+    // comes from `p.series()` straight against Prometheus, and a Prometheus
+    // that answers `data: []` to everything would make every panel look dead
+    // while Grafana's control passed happily.
+    //
+    // Skipped when the Prometheus source already ran it and it passed in this
+    // same run: the same two questions to the same instance, answered
+    // minutes apart, prove nothing the first pair did not.
+    if !prometheus_control_passed && let Err(e) = p.control(long, s.now) {
+        o.tool_failures
+            .push(format!("prometheus (the panels are judged against it) {e}"));
+        return;
+    }
     let dashboards = match g.dashboards() {
         Ok(d) => d,
         Err(e) => {
             o.tool_failures.push(format!("grafana search: {e}"));
             return;
         }
-    };
-    let p = Prometheus {
-        http: prom_net,
-        base: s.prometheus.clone(),
     };
     let mut cache: HashMap<String, (usize, usize)> = HashMap::new();
     for (uid, name) in dashboards {

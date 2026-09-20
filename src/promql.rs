@@ -28,7 +28,7 @@ impl ExprVisitor for Collector {
         // Unary, Binary, Paren, Subquery, Call and Extension — and treats
         // `Expr::MatrixSelector` as terminal, although it carries a
         // `VectorSelector` inside. Unwrapping it here is the difference
-        // between finding 101 selectors in this repo and finding a handful.
+        // between finding every selector in this repo and finding a handful.
         let vs = match e {
             Expr::VectorSelector(vs) => vs,
             Expr::MatrixSelector(ms) => &ms.vs,
@@ -109,7 +109,14 @@ mod tests {
     }
 
     /// `@` and `offset` belong to the expression, not to the series — and
-    /// /api/v1/series refuses them. Three rules in obs-regeln.yml carry one.
+    /// /api/v1/series refuses them. Dropping them means a rule with
+    /// `offset 2d` is asked about crosshair's window, not about the span it
+    /// evaluates over; for "does this series exist at all" that is right, and
+    /// it is written down in the design's addendum rather than left implicit.
+    /// (This comment said "three rules in obs-regeln.yml carry one" until
+    /// 0.1.1. Counted: ONE rule does, with two occurrences in one expression,
+    /// and no rule carries an `@` — the same occurrences-versus-distinct mix-up
+    /// as the 101 selectors that turned out to be 95.)
     #[test]
     fn offset_and_at_are_dropped() {
         assert_eq!(

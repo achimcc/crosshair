@@ -47,10 +47,7 @@ pub fn targets(doc: &Value) -> (Vec<Target>, Vec<(String, Skip)>) {
         doc
     };
     walk(root, &mut |panel: &Value| {
-        let title = panel["title"]
-            .as_str()
-            .unwrap_or("(ohne Titel)")
-            .to_string();
+        let title = panel["title"].as_str().unwrap_or("(untitled)").to_string();
         let panel_ds = panel["datasource"]["uid"]
             .as_str()
             .unwrap_or("")
@@ -142,7 +139,7 @@ impl Grafana<'_> {
         let arr = v
             .as_array()
             .context("/api/search did not answer an array")?;
-        Ok(arr
+        let out: Vec<(String, String)> = arr
             .iter()
             .filter_map(|d| {
                 let uid = d["uid"].as_str()?.to_string();
@@ -150,7 +147,17 @@ impl Grafana<'_> {
                 let title = d["title"].as_str().unwrap_or("");
                 Some((uid, format!("{folder}/{title}")))
             })
-            .collect())
+            .collect();
+        // AN EMPTY LIST IS NOT A GREEN RUN, IT IS AN EMPTY ONE — same as
+        // `loki::rules_from_yaml` and `Prometheus::rules`. A search that
+        // answers `[]` (a provisioner that ran into nothing, a session that
+        // is not one) would otherwise produce zero panel checks in silence.
+        if out.is_empty() {
+            bail!(
+                "/api/search names not a single dashboard — that is not a green run, it is an empty one"
+            );
+        }
+        Ok(out)
     }
 
     pub fn dashboard(&self, uid: &str) -> Result<Value> {
@@ -360,6 +367,40 @@ mod tests {
             base: "http://127.0.0.1:3000".into(),
         };
         assert!(g.control().is_err());
+    }
+
+    /// AN EMPTY DASHBOARD LIST IS NOT A GREEN RUN, IT IS AN EMPTY ONE — the
+    /// same sentence as in `loki::rules_from_yaml` and `Prometheus::rules`.
+    /// A Grafana whose search answers `[]` (a lost provisioner, a search
+    /// scoped to the wrong folder, a session that is not one) would otherwise
+    /// produce zero panel checks and a clean report.
+    #[test]
+    fn a_grafana_without_a_single_dashboard_is_an_error() {
+        let h = Canned::new(vec![("api/search", "[]")]);
+        let g = Grafana {
+            http: &h,
+            base: "http://127.0.0.1:3000".into(),
+        };
+        assert!(
+            g.dashboards().is_err(),
+            "an empty dashboard list must not look like a clean run"
+        );
+    }
+
+    #[test]
+    fn a_dashboard_list_with_entries_comes_back() {
+        let h = Canned::new(vec![(
+            "api/search",
+            r#"[{"uid":"abc","folderTitle":"Observability","title":"Self"}]"#,
+        )]);
+        let g = Grafana {
+            http: &h,
+            base: "http://127.0.0.1:3000".into(),
+        };
+        assert_eq!(
+            g.dashboards().unwrap(),
+            vec![("abc".to_string(), "Observability/Self".to_string())]
+        );
     }
 
     /// AUDIT (task-8): and a Grafana that answers NOTHING TO EVERYTHING —

@@ -1,6 +1,6 @@
 [package]
 name = "crosshair"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Does this rule point at anything real? Puts every selector of an alerting rule or dashboard panel to the running instance"

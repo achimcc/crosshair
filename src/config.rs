@@ -44,6 +44,18 @@ impl Config {
             if e.rule.is_some() && e.dashboard.is_some() {
                 bail!("an exception names both a rule and a dashboard — say which one");
             }
+            // `panel` NARROWS A `dashboard` AND NOTHING ELSE. Accepted next
+            // to a `rule` it was silently ignored, and the entry then
+            // excepted EVERY dead selector of that rule instead of the one
+            // panel it was written for. An exception that is wider than it
+            // reads hides a finding, and that is the failure this whole tool
+            // exists to abolish.
+            if e.rule.is_some() && e.panel.is_some() {
+                bail!(
+                    "an exception names a rule and a panel — `panel` only narrows a `dashboard`, and next to `rule` it would be ignored, widening the exception to every dead selector of that rule (reason: {})",
+                    e.reason.lines().next().unwrap_or("")
+                );
+            }
         }
         Ok(())
     }
@@ -195,6 +207,23 @@ mod tests {
         )
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    /// `panel` NARROWS A `dashboard` AND NOTHING ELSE. Next to a `rule` it
+    /// used to be accepted and then silently ignored — so an entry written to
+    /// except ONE panel of a rule excepted EVERY dead selector of that rule.
+    /// Exceptions are the one place where being wrong hides a finding, which
+    /// is the whole failure mode this tool exists to abolish.
+    #[test]
+    fn an_exception_naming_a_rule_and_a_panel_is_refused() {
+        let c: Config = toml::from_str(
+            "[[exception]]\nrule = \"X\"\npanel = \"Ein Panel\"\nreason = \"ambiguous\"\n",
+        )
+        .unwrap();
+        assert!(
+            c.validate().is_err(),
+            "`panel` next to `rule` must be refused, not silently ignored"
+        );
     }
 
     /// AUDIT 2: A panel exception that narrows by panel should NOT cover a different panel of the same dashboard.

@@ -44,6 +44,15 @@ impl Prometheus<'_> {
                 });
             }
         }
+        // AN EMPTY INVENTORY IS NOT A GREEN RUN, IT IS AN EMPTY ONE — the
+        // same sentence `loki::rules_from_yaml` says, and for the same
+        // reason: without this, a Prometheus that has loaded no rule at all
+        // produces zero checks, no failure and a clean report.
+        if out.is_empty() {
+            bail!(
+                "/api/v1/rules names not a single rule — that is not a green run, it is an empty one"
+            );
+        }
         Ok(out)
     }
 
@@ -141,14 +150,53 @@ mod tests {
     }
 
     /// Same tool-failure-not-a-finding rule as `series()`, and the same trap:
-    /// the `data` field must be present and well-formed (`groups: []`), or the
-    /// missing/malformed array raises its own error and the test passes for
-    /// the wrong reason even with the status check gone.
+    /// the `data` field must be present, well-formed AND HOLD A RULE, or one
+    /// of the other two errors (`no groups`, "not a single rule") raises
+    /// itself and the test passes for the wrong reason even with the status
+    /// check gone. The rule inside was added with the emptiness check in
+    /// 0.1.1 — with `groups: []` the test had stopped pinning `status`.
     #[test]
     fn an_unsuccessful_rules_answer_is_an_error() {
         let h = Canned::new(vec![(
             "api/v1/rules",
-            r#"{"status":"error","error":"bad","data":{"groups":[]}}"#,
+            r#"{"status":"error","error":"bad","data":{"groups":[{"name":"g","rules":[
+            {"name":"R","type":"alerting","query":"up","health":"ok","lastError":""}]}]}}"#,
+        )]);
+        let p = Prometheus {
+            http: &h,
+            base: "http://x:9090".into(),
+        };
+        assert!(p.rules().is_err());
+    }
+
+    /// AN EMPTY INVENTORY IS NOT A GREEN RUN, IT IS AN EMPTY ONE — the same
+    /// sentence `loki::rules_from_yaml` says about a rule file without a
+    /// rule, and the same reason: a Prometheus that has loaded nothing
+    /// answers every question about "are the rules alive" with silence, and
+    /// silence here reads as health.
+    #[test]
+    fn an_answer_without_a_single_rule_is_an_error() {
+        let h = Canned::new(vec![(
+            "api/v1/rules",
+            r#"{"status":"success","data":{"groups":[]}}"#,
+        )]);
+        let p = Prometheus {
+            http: &h,
+            base: "http://x:9090".into(),
+        };
+        assert!(
+            p.rules().is_err(),
+            "an instance without a single rule must not look like a clean inventory"
+        );
+    }
+
+    /// And a group that exists but holds no rule is the same emptiness one
+    /// level down.
+    #[test]
+    fn groups_without_any_rule_are_an_error_too() {
+        let h = Canned::new(vec![(
+            "api/v1/rules",
+            r#"{"status":"success","data":{"groups":[{"name":"g","rules":[]}]}}"#,
         )]);
         let p = Prometheus {
             http: &h,

@@ -342,4 +342,21 @@ groups:
         };
         assert!(l.control(0, 1).is_err());
     }
+
+    /// And the other direction, the one that is much easier to overlook: an
+    /// instance that answers a stream to EVERYTHING — including the job name
+    /// invented for this control — is just as broken. Prometheus and Grafana
+    /// each pin both directions; this is Loki's.
+    #[test]
+    fn an_instance_that_matches_everything_fails_the_control() {
+        let h = Canned::new(vec![(
+            "loki/api/v1/series",
+            r#"{"status":"success","data":[{"gast":"vps"}]}"#,
+        )]);
+        let l = Loki {
+            http: &h,
+            base: "http://x:3100".into(),
+        };
+        assert!(l.control(0, 1).is_err());
+    }
 }
