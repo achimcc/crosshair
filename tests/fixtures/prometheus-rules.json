@@ -1,0 +1,6 @@
+{"status":"success","data":{"groups":[
+ {"name":"kern","rules":[
+  {"name":"InsistSendetNicht","type":"alerting","query":"insist_publish_pending > 0","health":"ok","lastError":""},
+  {"name":"job:up:sum","type":"recording","query":"sum(up)","health":"ok","lastError":""},
+  {"name":"KaputteRegel","type":"alerting","query":"rate(foo[5m])","health":"err","lastError":"vector cannot contain metrics"}
+ ]}]}}
