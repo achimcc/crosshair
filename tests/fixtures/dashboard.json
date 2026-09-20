@@ -1,0 +1,11 @@
+{"dashboard":{"title":"Probe","panels":[
+ {"type":"timeseries","title":"Gute Kachel","datasource":{"uid":"prometheus"},
+  "targets":[{"refId":"A","expr":"sum(rate(radarr_movie_total[$__rate_interval]))"}]},
+ {"type":"row","title":"Eingeklappt","panels":[
+   {"type":"stat","title":"In der Row","datasource":{"uid":"prometheus"},
+    "targets":[{"refId":"B","expr":"sonarr_series_total"}]}]},
+ {"type":"logs","title":"Aus Loki","datasource":{"uid":"loki"},
+  "targets":[{"refId":"C","expr":"{gast=\"vps\"}"}]},
+ {"type":"stat","title":"Mit Variable","datasource":{"uid":"prometheus"},
+  "targets":[{"refId":"D","expr":"up{job=\"$job\"}"}]}
+]},"meta":{"provisioned":true}}
