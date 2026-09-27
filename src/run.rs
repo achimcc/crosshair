@@ -299,6 +299,7 @@ fn grafana_source(
     let g = Grafana {
         http: net,
         base: s.grafana.clone(),
+        password: s.grafana_password.clone(),
     };
     if let Some(pw) = &s.grafana_password
         && let Err(e) = g.login(pw)
