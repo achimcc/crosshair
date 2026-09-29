@@ -72,6 +72,12 @@ touching any real selector, crosshair asks each source two of its own:
   Loki),
 - one that must not (a label value invented for this purpose).
 
+On Prometheus, `up` must match in **both** windows. Asked over the long
+window alone, an instance that stopped ingesting yesterday still has seven
+days of `up` to show; the control passed, every selector came back `quiet`,
+and `quiet` changes no exit code — a deaf Prometheus read as a calm week.
+Since 0.2.0 an `up` without series in the short window is a tool failure.
+
 If the first misses or the second hits, the run fails with exit 2 and says
 why, instead of quietly reporting a clean bill of health for a source it
 never actually reached.
@@ -112,7 +118,10 @@ OPTIONS:
         --loki URL           default http://localhost:3100
         --loki-rules FILE    the LogQL rules; the Ruler API is not enabled here
         --grafana URL        default http://127.0.0.1:3000
-        --grafana-password-file PATH
+        --grafana-token-file PATH
+                             a Grafana service-account token, role Viewer, sent
+                             as `Authorization: Bearer`; the file holds the
+                             token alone (a trailing newline is fine)
         --via-ssh TARGET     reach prometheus and loki through ssh + curl
         --source LIST        prometheus,loki,grafana (default: all three);
                              an unknown name is an error, never a no-op
@@ -134,7 +143,7 @@ never visited would look unused without being it.
 Prometheus and Loki commonly listen on an address the workstation running
 crosshair cannot reach directly; `--via-ssh` wraps the same `curl` calls in
 an `ssh`. Grafana is usually reached through an ordinary local port-forward
-instead, since it also needs a login and a cookie jar for the session:
+instead:
 
 ```console
 $ ssh -f -N -L 3000:10.0.20.12:3000 server   # Grafana's own tunnel
@@ -144,9 +153,30 @@ $ crosshair check \
     --loki-rules loki-regeln.yml \
     --via-ssh    server \
     --grafana    http://127.0.0.1:3000 \
-    --grafana-password-file /run/secrets/grafana-admin-password \
+    --grafana-token-file "$XDG_RUNTIME_DIR/grafana-crosshair.token" \
     --config     crosshair.toml
 ```
+
+### Signing in to Grafana
+
+crosshair only reads from Grafana — the dashboard search, the dashboards
+themselves and `/api/ds/query` — so it signs in with a **service-account
+token with the role Viewer** and nothing more. Create one under
+*Administration → Service accounts*, put the token alone into a file (one
+trailing newline is fine, anything else is refused), and pass the file with
+`--grafana-token-file`. Without the option crosshair asks Grafana
+anonymously.
+
+The token goes out as `Authorization: Bearer …`, to Grafana and to nothing
+else. It never appears in argv: crosshair writes the header into a file of
+its own, mode 0600, hands curl only its path (`-H @file`) and removes it when
+the run ends. No error message quotes the token.
+
+Until 0.1.x crosshair logged in with the Grafana **admin** password through
+`/login` (`--grafana-password-file`) and kept a session cookie, renewing it
+whenever Grafana rotated the session — the one credential that can change
+every dashboard, held by a tool that changes none. 0.2.0 removed that path
+and the option with it; passing `--grafana-password-file` is now an error.
 
 ## The exception file — `crosshair.toml`
 

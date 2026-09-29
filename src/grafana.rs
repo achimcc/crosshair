@@ -107,65 +107,27 @@ fn walk(v: &Value, f: &mut impl FnMut(&Value)) {
     }
 }
 
+/// WHO ASKS: whatever the `Http` in front carries. For the real run that is
+/// a `Curl` whose header file holds a service-account token with the role
+/// Viewer (`--grafana-token-file`) — this adapter only reads, so it has no
+/// business holding more.
+///
+/// UNTIL 0.2.0 IT LOGGED IN AS `admin` (audit B138 / CD-10): the admin
+/// password through `/login`, a session cookie, and a second login every
+/// ten minutes when Grafana rotated the session. A tool that searches
+/// dashboards and runs `/api/ds/query` held the one credential that can
+/// change every one of them. A token does not rotate, so the renewal went
+/// with the login.
 pub struct Grafana<'a> {
     pub http: &'a dyn Http,
     pub base: String,
-    /// Kept for the SECOND login, not only the first: Grafana rotates the
-    /// session token every `token_rotation_interval_minutes` (default 10).
-    /// Its frontend calls the rotation endpoint; a client that does not gets a
-    /// 401 on the next request. A run through all dashboards takes longer than
-    /// that -- on 2026-09-27 every dashboard after minute ten failed with
-    /// `returned error: 401`, and the run reported NOTHING about the panels.
-    pub password: Option<String>,
-}
-
-/// curl with `--fail` turns the status into its exit message; that text is
-/// the only place the 401 survives.
-fn is_unauthorized(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("returned error: 401")
 }
 
 impl Grafana<'_> {
-    /// THROUGH THE LOGIN FORM: `auth.basic.enabled = false` on this
-    /// installation, so `curl -u` gets a 401. The password travels in the
-    /// body, which goes over stdin — never argv.
-    ///
-    /// AND IT FAILS CLOSED. An earlier draft also accepted an answer with no
-    /// `message` field at all, on the reasoning that `curl --fail` would have
-    /// turned any non-2xx into an error before we got here. That reasoning is
-    /// unfalsifiable and buys nothing: anything that answers 200 with an
-    /// unexpected body — a proxy, a cache, a future Grafana — would then be
-    /// reported as a session we do not have.
-    pub fn login(&self, password: &str) -> Result<()> {
-        let body = json!({ "user": "admin", "password": password }).to_string();
-        let v = self.http.post(&format!("{}/login", self.base), &body)?;
-        if v["message"].as_str() == Some("Logged in") {
-            return Ok(());
-        }
-        bail!("grafana did not confirm the login: {}", v["message"]);
-    }
-
-    /// ONE retry after a fresh login, and only on a 401 and only with a
-    /// password -- a second 401 is a real refusal and stays an error.
-    fn with_session<T>(&self, f: impl Fn() -> Result<T>) -> Result<T> {
-        match f() {
-            Err(e) if is_unauthorized(&e) => match &self.password {
-                Some(pw) => {
-                    self.login(pw)
-                        .context("the session expired and the new login failed")?;
-                    f()
-                }
-                None => Err(e),
-            },
-            other => other,
-        }
-    }
-
     pub fn dashboards(&self) -> Result<Vec<(String, String)>> {
-        let v = self.with_session(|| {
-            self.http
-                .get(&format!("{}/api/search?type=dash-db&limit=5000", self.base))
-        })?;
+        let v = self
+            .http
+            .get(&format!("{}/api/search?type=dash-db&limit=5000", self.base))?;
         let arr = v
             .as_array()
             .context("/api/search did not answer an array")?;
@@ -180,8 +142,8 @@ impl Grafana<'_> {
             .collect();
         // AN EMPTY LIST IS NOT A GREEN RUN, IT IS AN EMPTY ONE — same as
         // `loki::rules_from_yaml` and `Prometheus::rules`. A search that
-        // answers `[]` (a provisioner that ran into nothing, a session that
-        // is not one) would otherwise produce zero panel checks in silence.
+        // answers `[]` (a provisioner that ran into nothing, a token that
+        // sees no folder) would otherwise produce zero panel checks in silence.
         if out.is_empty() {
             bail!(
                 "/api/search names not a single dashboard — that is not a green run, it is an empty one"
@@ -191,10 +153,8 @@ impl Grafana<'_> {
     }
 
     pub fn dashboard(&self, uid: &str) -> Result<Value> {
-        self.with_session(|| {
-            self.http
-                .get(&format!("{}/api/dashboards/uid/{uid}", self.base))
-        })
+        self.http
+            .get(&format!("{}/api/dashboards/uid/{uid}", self.base))
     }
 
     /// One request for a batch of expressions; the answers keep their order
@@ -213,10 +173,9 @@ impl Grafana<'_> {
             })
             .collect();
         let body = json!({ "from": "now-24h", "to": "now", "queries": queries }).to_string();
-        let v = self.with_session(|| {
-            self.http
-                .post(&format!("{}/api/ds/query", self.base), &body)
-        })?;
+        let v = self
+            .http
+            .post(&format!("{}/api/ds/query", self.base), &body)?;
         let results = v
             .get("results")
             .context("an answer without results is not a check, it is its failure")?;
@@ -316,54 +275,11 @@ mod tests {
         let g = Grafana {
             http: &h,
             base: "http://127.0.0.1:3000".into(),
-            password: None,
         };
         let r = g.query(&["a".into(), "b".into(), "c".into()]).unwrap();
         assert!(matches!(r[0], QueryOutcome::Series(2)));
         assert!(matches!(r[1], QueryOutcome::Series(0)));
         assert!(matches!(&r[2], QueryOutcome::Error(e) if e.contains("Datasource not found")));
-    }
-
-    #[test]
-    fn a_login_that_is_refused_is_an_error() {
-        let h = Canned::new(vec![(
-            "login",
-            r#"{"message":"Invalid username or password"}"#,
-        )]);
-        let g = Grafana {
-            http: &h,
-            base: "http://127.0.0.1:3000".into(),
-            password: None,
-        };
-        assert!(g.login("wrong").is_err());
-    }
-
-    /// A 200 with a body that does not confirm the login is NOT a session.
-    /// `Canned` has no HTTP status, which is the point: it stands in for
-    /// every intermediary that answers cheerfully without logging anyone in.
-    #[test]
-    fn a_login_answer_without_a_confirmation_is_an_error() {
-        let h = Canned::new(vec![("login", "{}")]);
-        let g = Grafana {
-            http: &h,
-            base: "http://127.0.0.1:3000".into(),
-            password: None,
-        };
-        assert!(
-            g.login("whatever").is_err(),
-            "a message-less answer must not count as a session"
-        );
-    }
-
-    #[test]
-    fn the_confirmed_login_is_accepted() {
-        let h = Canned::new(vec![("login", r#"{"message":"Logged in"}"#)]);
-        let g = Grafana {
-            http: &h,
-            base: "http://127.0.0.1:3000".into(),
-            password: None,
-        };
-        assert!(g.login("right").is_ok());
     }
 
     /// AUDIT (task-8): a frame that carries no series at all — an empty
@@ -382,7 +298,6 @@ mod tests {
         let g = Grafana {
             http: &h,
             base: "http://127.0.0.1:3000".into(),
-            password: None,
         };
         let r = g.query(&["a".into(), "b".into()]).unwrap();
         assert!(matches!(r[0], QueryOutcome::Series(0)));
@@ -403,7 +318,6 @@ mod tests {
         let g = Grafana {
             http: &h,
             base: "http://127.0.0.1:3000".into(),
-            password: None,
         };
         assert!(g.control().is_err());
     }
@@ -411,7 +325,7 @@ mod tests {
     /// AN EMPTY DASHBOARD LIST IS NOT A GREEN RUN, IT IS AN EMPTY ONE — the
     /// same sentence as in `loki::rules_from_yaml` and `Prometheus::rules`.
     /// A Grafana whose search answers `[]` (a lost provisioner, a search
-    /// scoped to the wrong folder, a session that is not one) would otherwise
+    /// scoped to the wrong folder, a token that sees no folder) would otherwise
     /// produce zero panel checks and a clean report.
     #[test]
     fn a_grafana_without_a_single_dashboard_is_an_error() {
@@ -419,7 +333,6 @@ mod tests {
         let g = Grafana {
             http: &h,
             base: "http://127.0.0.1:3000".into(),
-            password: None,
         };
         assert!(
             g.dashboards().is_err(),
@@ -436,7 +349,6 @@ mod tests {
         let g = Grafana {
             http: &h,
             base: "http://127.0.0.1:3000".into(),
-            password: None,
         };
         assert_eq!(
             g.dashboards().unwrap(),
@@ -458,92 +370,7 @@ mod tests {
         let g = Grafana {
             http: &h,
             base: "http://127.0.0.1:3000".into(),
-            password: None,
         };
         assert!(g.control().is_err());
-    }
-
-    /// Grafana after `token_rotation_interval_minutes`: the session is gone
-    /// until someone logs in again. Records what was asked, in order.
-    struct Expiring {
-        logged_in: std::cell::Cell<bool>,
-        login_answer: &'static str,
-        calls: std::cell::RefCell<Vec<String>>,
-    }
-
-    impl Expiring {
-        fn new(login_answer: &'static str) -> Self {
-            Expiring {
-                logged_in: std::cell::Cell::new(false),
-                login_answer,
-                calls: std::cell::RefCell::new(Vec::new()),
-            }
-        }
-        fn answer(&self, url: &str) -> Result<Value> {
-            self.calls.borrow_mut().push(url.to_string());
-            if url.ends_with("/login") {
-                let v: Value = serde_json::from_str(self.login_answer).unwrap();
-                self.logged_in.set(v["message"] == "Logged in");
-                return Ok(v);
-            }
-            if !self.logged_in.get() {
-                anyhow::bail!(
-                    "curl failed (exit status: 22): curl: (22) The requested URL returned error: 401"
-                );
-            }
-            Ok(serde_json::json!({"dashboard": {"panels": []}}))
-        }
-    }
-
-    impl Http for Expiring {
-        fn get(&self, url: &str) -> Result<Value> {
-            self.answer(url)
-        }
-        fn post(&self, url: &str, _body: &str) -> Result<Value> {
-            self.answer(url)
-        }
-    }
-
-    /// The 2026-09-27 case: every dashboard after minute ten answered 401.
-    #[test]
-    fn an_expired_session_is_renewed_once_and_the_request_repeated() {
-        let h = Expiring::new(r#"{"message":"Logged in"}"#);
-        let g = Grafana {
-            http: &h,
-            base: "http://127.0.0.1:3000".into(),
-            password: Some("right".into()),
-        };
-        assert!(g.dashboard("abc").is_ok());
-        let calls = h.calls.borrow();
-        assert_eq!(calls.len(), 3, "{calls:?}");
-        assert!(calls[1].ends_with("/login"));
-        assert!(calls[2].ends_with("/api/dashboards/uid/abc"));
-    }
-
-    /// Without a password there is nothing to renew with: the 401 stays.
-    #[test]
-    fn without_a_password_a_401_stays_an_error() {
-        let h = Expiring::new(r#"{"message":"Logged in"}"#);
-        let g = Grafana {
-            http: &h,
-            base: "http://127.0.0.1:3000".into(),
-            password: None,
-        };
-        assert!(g.dashboard("abc").is_err());
-        assert_eq!(h.calls.borrow().len(), 1);
-    }
-
-    /// A refused second login is not papered over, and it says why.
-    #[test]
-    fn a_refused_renewal_is_an_error_that_says_so() {
-        let h = Expiring::new(r#"{"message":"Invalid username or password"}"#);
-        let g = Grafana {
-            http: &h,
-            base: "http://127.0.0.1:3000".into(),
-            password: Some("wrong".into()),
-        };
-        let e = g.dashboard("abc").unwrap_err();
-        assert!(format!("{e:#}").contains("new login failed"), "{e:#}");
-        assert_eq!(h.calls.borrow().len(), 2);
     }
 }

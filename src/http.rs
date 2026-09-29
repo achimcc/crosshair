@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 
 pub trait Http {
     fn get(&self, url: &str) -> Result<Value>;
-    /// `body` goes to curl's STDIN, never into argv — a Grafana login carries
-    /// a password, and argv is world-readable in /proc.
+    /// `body` goes to curl's STDIN, never into argv — argv is world-readable
+    /// in /proc, and a body is the kind of thing that one day carries a secret.
     fn post(&self, url: &str, body: &str) -> Result<Value>;
 }
 
@@ -34,14 +34,20 @@ pub fn percent_encode(s: &str) -> String {
 
 pub struct Curl {
     pub via_ssh: Option<String>,
-    pub cookie_jar: Option<PathBuf>,
+    /// A file of extra request headers, handed to curl as `-H @<path>`.
+    ///
+    /// THIS IS HOW THE GRAFANA TOKEN TRAVELS, and the only way that keeps it
+    /// out of argv: `-H "Authorization: Bearer …"` or `--oauth2-bearer …`
+    /// would put it in /proc/<pid>/cmdline for every local user to read.
+    /// argv carries the PATH; the file is created 0600 by `main`.
+    pub header_file: Option<PathBuf>,
 }
 
 /// Single-quote one argument for a remote `sh`. Everything inside single
 /// quotes is literal; an embedded quote is closed, escaped and reopened.
 ///
 /// THE URL IS ALREADY PERCENT-ENCODED when it gets here, so it cannot carry
-/// a quote, a backtick, a space or a `$` — but a cookie-jar path can, and the
+/// a quote, a backtick, a space or a `$` — but a header-file path can, and the
 /// ssh route hands the whole line to a shell.
 fn sh_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
@@ -65,11 +71,9 @@ impl Curl {
             "--max-time".into(),
             "120".into(),
         ];
-        if let Some(jar) = &self.cookie_jar {
-            curl.push("-c".into());
-            curl.push(jar.display().to_string());
-            curl.push("-b".into());
-            curl.push(jar.display().to_string());
+        if let Some(headers) = &self.header_file {
+            curl.push("-H".into());
+            curl.push(format!("@{}", headers.display()));
         }
         curl.extend(extra.iter().map(|a| a.to_string()));
         curl.push(url.to_string());
@@ -218,12 +222,12 @@ mod tests {
     fn the_local_command_is_curl_and_the_remote_one_is_ssh_wrapped() {
         let local = Curl {
             via_ssh: None,
-            cookie_jar: None,
+            header_file: None,
         };
         assert_eq!(local.command("http://x/y")[0], "curl");
         let remote = Curl {
             via_ssh: Some("server".into()),
-            cookie_jar: None,
+            header_file: None,
         };
         let c = remote.command("http://x/y");
         assert_eq!(c[0], "ssh");
@@ -237,7 +241,7 @@ mod tests {
     fn a_post_over_ssh_keeps_its_header_in_one_piece() {
         let c = Curl {
             via_ssh: Some("server".into()),
-            cookie_jar: None,
+            header_file: None,
         };
         let argv = c.command_with(
             "http://x/y",
@@ -266,17 +270,36 @@ mod tests {
 
     /// A path with a space must survive the trip to the remote shell as ONE
     /// argument. The URL cannot carry one (it is percent-encoded before it
-    /// gets here), but a cookie jar can.
+    /// gets here), but a header-file path can.
     #[test]
     fn a_path_with_a_space_stays_one_argument_for_the_remote_shell() {
         let c = Curl {
             via_ssh: Some("server".into()),
-            cookie_jar: Some("/tmp/my jar.cookies".into()),
+            header_file: Some("/tmp/my headers".into()),
         };
         let line = c.command("http://x/y").last().unwrap().clone();
         assert!(
-            line.contains(r"'/tmp/my jar.cookies'"),
-            "cookie jar not quoted: {line}"
+            line.contains(r"'@/tmp/my headers'"),
+            "header file not quoted: {line}"
+        );
+    }
+
+    /// THE TOKEN IS NOT IN ARGV, ONLY ITS PATH. The header file is handed
+    /// over as `-H @<path>`, which curl reads itself; nothing on the command
+    /// line names the scheme or the credential.
+    #[test]
+    fn the_header_file_goes_in_by_path_and_nothing_else_does() {
+        let c = Curl {
+            via_ssh: None,
+            header_file: Some("/tmp/h".into()),
+        };
+        let argv = c.command("http://x/y");
+        let at = argv.iter().position(|a| a == "@/tmp/h").expect("no @path");
+        assert_eq!(argv[at - 1], "-H");
+        assert!(
+            argv.iter()
+                .all(|a| !a.contains("Bearer") && !a.contains("Authorization")),
+            "{argv:?}"
         );
     }
 
@@ -286,7 +309,7 @@ mod tests {
     fn the_local_argument_list_carries_no_shell_quotes() {
         let c = Curl {
             via_ssh: None,
-            cookie_jar: Some("/tmp/jar".into()),
+            header_file: Some("/tmp/h".into()),
         };
         assert!(c.command("http://x/y").iter().all(|a| !a.contains('\'')));
     }
@@ -298,7 +321,7 @@ mod tests {
     fn curl_keeps_its_reason() {
         let c = Curl {
             via_ssh: None,
-            cookie_jar: None,
+            header_file: None,
         }
         .command("http://x/y");
         assert!(c.contains(&"-sS".to_string()));

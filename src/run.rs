@@ -23,7 +23,6 @@ pub struct Settings {
     pub loki: String,
     pub loki_rules: Option<PathBuf>,
     pub grafana: String,
-    pub grafana_password: Option<String>,
     pub sources: Vec<String>,
     pub long_secs: i64,
     pub short_secs: i64,
@@ -137,7 +136,7 @@ fn prometheus_source(s: &Settings, o: &mut Outcome, net: &dyn Http, long: i64, s
         http: net,
         base: s.prometheus.clone(),
     };
-    if let Err(e) = p.control(long, s.now) {
+    if let Err(e) = p.control(long, short, s.now) {
         o.tool_failures.push(format!("prometheus {e}"));
         return false;
     }
@@ -299,14 +298,7 @@ fn grafana_source(
     let g = Grafana {
         http: net,
         base: s.grafana.clone(),
-        password: s.grafana_password.clone(),
     };
-    if let Some(pw) = &s.grafana_password
-        && let Err(e) = g.login(pw)
-    {
-        o.tool_failures.push(format!("grafana: {e}"));
-        return;
-    }
     if let Err(e) = g.control() {
         o.tool_failures.push(format!("grafana: {e}"));
         return;
@@ -324,7 +316,7 @@ fn grafana_source(
     // Skipped when the Prometheus source already ran it and it passed in this
     // same run: the same two questions to the same instance, answered
     // minutes apart, prove nothing the first pair did not.
-    if !prometheus_control_passed && let Err(e) = p.control(long, s.now) {
+    if !prometheus_control_passed && let Err(e) = p.control(long, short, s.now) {
         o.tool_failures
             .push(format!("prometheus (the panels are judged against it) {e}"));
         return;

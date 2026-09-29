@@ -17,7 +17,6 @@ fn settings_for(sources: &[&str]) -> Settings {
         loki: "http://x:3100".into(),
         loki_rules: None,
         grafana: "http://x:3000".into(),
-        grafana_password: None,
         sources: sources.iter().map(|s| s.to_string()).collect(),
         long_secs: 604800,
         short_secs: 900,
@@ -373,5 +372,58 @@ fn a_run_whose_sources_produce_nothing_is_a_tool_failure() {
             .any(|t| t.contains("not a single selector")),
         "and it must say so: {:?}",
         o.tool_failures
+    );
+}
+
+/// AUDIT B138 / CD-10: A PROMETHEUS THAT STOPPED INGESTING PASSED THE CONTROL.
+/// `up` was asked over the long window only, and seven days of history still
+/// answer there after the scrapes have stopped. Every selector then came back
+/// `quiet` — hit long, empty short — and `quiet` never changes the exit code:
+/// a deaf instance read as a calm week, exit 0.
+///
+/// `now` is 1_000_000, so the long window starts at 395200 and the short one
+/// at 999100; the recorded answers tell them apart by `start=`.
+#[test]
+fn an_instance_with_up_only_in_the_long_window_is_a_tool_failure() {
+    let h = Canned::new(vec![
+        (
+            "match%5B%5D=up%7Bjob%3D%22crosshair",
+            r#"{"status":"success","data":[]}"#,
+        ),
+        (
+            "match%5B%5D=up&start=395200",
+            r#"{"status":"success","data":[{"__name__":"up"}]}"#,
+        ),
+        (
+            "match%5B%5D=up&start=999100",
+            r#"{"status":"success","data":[]}"#,
+        ),
+        (
+            "match%5B%5D=wasdaswar&start=395200",
+            r#"{"status":"success","data":[{"__name__":"wasdaswar"}]}"#,
+        ),
+        (
+            "match%5B%5D=wasdaswar&start=999100",
+            r#"{"status":"success","data":[]}"#,
+        ),
+        (
+            "api/v1/rules",
+            r#"{"status":"success","data":{"groups":[{"name":"g","rules":[
+            {"name":"Verstummt","type":"alerting","query":"wasdaswar > 0","health":"ok","lastError":""}]}]}}"#,
+        ),
+    ]);
+    let o = run(&settings(), &Config::default(), &h, &h);
+    assert!(
+        o.tool_failures
+            .iter()
+            .any(|t| t.contains("control") && t.contains("short window")),
+        "a Prometheus with `up` only in the long window must fail the control: {:?} / checks {:?}",
+        o.tool_failures,
+        o.checks
+    );
+    assert_eq!(
+        o.exit_code(),
+        2,
+        "a deaf instance must not look like a quiet week"
     );
 }

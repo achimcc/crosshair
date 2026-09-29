@@ -25,7 +25,10 @@ OPTIONS:
         --loki URL           default http://localhost:3100
         --loki-rules FILE    the LogQL rules; the Ruler API is not enabled here
         --grafana URL        default http://127.0.0.1:3000
-        --grafana-password-file PATH
+        --grafana-token-file PATH
+                             a Grafana service-account token, role Viewer, sent
+                             as `Authorization: Bearer`; the file holds the
+                             token alone (a trailing newline is fine)
         --via-ssh TARGET     reach prometheus and loki through ssh + curl
         --source LIST        prometheus,loki,grafana (default: all three);
                              an unknown name is an error, never a silent no-op
@@ -50,7 +53,7 @@ struct Args {
     loki: Option<String>,
     loki_rules: Option<PathBuf>,
     grafana: Option<String>,
-    grafana_password_file: Option<PathBuf>,
+    grafana_token_file: Option<PathBuf>,
     via_ssh: Option<String>,
     sources: Option<String>,
     long: Option<String>,
@@ -68,7 +71,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("loki") => a.loki = Some(p.value()?.string()?),
             Long("loki-rules") => a.loki_rules = Some(p.value()?.into()),
             Long("grafana") => a.grafana = Some(p.value()?.string()?),
-            Long("grafana-password-file") => a.grafana_password_file = Some(p.value()?.into()),
+            Long("grafana-token-file") => a.grafana_token_file = Some(p.value()?.into()),
             Long("via-ssh") => a.via_ssh = Some(p.value()?.string()?),
             Long("source") => a.sources = Some(p.value()?.string()?),
             Long("long") => a.long = Some(p.value()?.string()?),
@@ -116,22 +119,59 @@ fn parse_sources(list: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// The cookie jar for Grafana's session, CREATED HERE AND NOT BY CURL.
+/// The token out of `--grafana-token-file`: the file holds the token and
+/// nothing else. ONE trailing newline is tolerated, because `echo` and every
+/// editor write one; anything else that is not a visible ASCII character is
+/// refused rather than trimmed.
 ///
-/// curl creates it under whatever umask is in effect — 0644 in a default
-/// login shell — under a name that can be guessed from the process id, in a
-/// directory everyone may write to. `create_new` on top of the mode: a file
-/// that is already there gets a loud error rather than a write through
-/// whatever it turns out to be.
-fn create_cookie_jar(path: &std::path::Path) -> Result<()> {
+/// WHY SO STRICT: the token goes into a header FILE, one header per line. A
+/// token with a second line in it would be a second header, and a space in
+/// the middle is a file that holds something other than a token.
+///
+/// AND NO ERROR NAMES THE VALUE. The message says what is wrong with the file,
+/// never what is in it — it lands on stderr and in whatever log runs this.
+fn read_token(text: &str) -> Result<String> {
+    let t = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    if t.is_empty() {
+        anyhow::bail!("the grafana token file is empty");
+    }
+    if !t.bytes().all(|b| b.is_ascii_graphic()) {
+        anyhow::bail!(
+            "the grafana token file holds more than one token: whitespace, a second line or a non-ASCII character"
+        );
+    }
+    Ok(t.to_string())
+}
+
+/// A file for a secret, CREATED HERE AND NOT BY CURL: mode 0600 from the
+/// first byte, and `create_new`, so a file already sitting under that name —
+/// a symlink planted in a directory everyone may write to — is a loud error
+/// rather than a write through whatever it turns out to be.
+fn create_private(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .with_context(|| format!("creating the cookie jar {}", path.display()))?;
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Removes the header file on every way out of `real_main`, the `?` ones
+/// included — it carries the token.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// `7d`, `90m`, `3600` — seconds out.
@@ -177,13 +217,10 @@ fn real_main() -> Result<u8> {
     };
     cfg.validate()?;
 
-    let password = match &a.grafana_password_file {
-        Some(p) => Some(
-            std::fs::read_to_string(p)
-                .with_context(|| format!("{}", p.display()))?
-                .trim()
-                .to_string(),
-        ),
+    let token = match &a.grafana_token_file {
+        Some(p) => Some(read_token(
+            &std::fs::read_to_string(p).with_context(|| format!("{}", p.display()))?,
+        )?),
         None => None,
     };
 
@@ -194,7 +231,6 @@ fn real_main() -> Result<u8> {
         loki: a.loki.unwrap_or_else(|| "http://localhost:3100".into()),
         loki_rules: a.loki_rules,
         grafana: a.grafana.unwrap_or_else(|| "http://127.0.0.1:3000".into()),
-        grafana_password: password,
         sources,
         long_secs: duration(a.long.as_deref().unwrap_or("7d"))?,
         short_secs: duration(a.short.as_deref().unwrap_or("15m"))?,
@@ -204,29 +240,42 @@ fn real_main() -> Result<u8> {
     };
 
     // Prometheus and Loki live on an internal address and are reached over
-    // ssh; Grafana over the local tunnel, with a cookie jar for the session.
+    // ssh; Grafana over the local tunnel, with the token in a header file.
+    // Prometheus and Loki never see the token: it belongs to Grafana alone.
     let net = Curl {
         via_ssh: a.via_ssh.clone(),
-        cookie_jar: None,
+        header_file: None,
     };
-    // The nanoseconds are not decoration: with the pid alone a crashed run
-    // leaves a jar behind that `create_new` would then refuse for the next
-    // run that happens to get the same pid.
-    let jar = std::env::temp_dir().join(format!(
-        "crosshair-{}-{}.cookies",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .subsec_nanos()
-    ));
-    create_cookie_jar(&jar)?;
+    let headers = match token {
+        Some(t) => {
+            // The nanoseconds are not decoration: with the pid alone a
+            // crashed run leaves a file behind that `create_new` would then
+            // refuse for the next run that happens to get the same pid.
+            let path = std::env::temp_dir().join(format!(
+                "crosshair-{}-{}.headers",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .subsec_nanos()
+            ));
+            // Empty first, the guard second, the token third: a failed
+            // `create_new` means the file is SOMEONE ELSE'S, and a guard
+            // made before it would delete that.
+            create_private(&path, "")?;
+            let guard = RemoveOnDrop(path);
+            std::fs::write(&guard.0, format!("Authorization: Bearer {t}\n"))
+                .with_context(|| format!("writing {}", guard.0.display()))?;
+            Some(guard)
+        }
+        None => None,
+    };
     let grafana_net = Curl {
         via_ssh: None,
-        cookie_jar: Some(jar.clone()),
+        header_file: headers.as_ref().map(|g| g.0.clone()),
     };
 
     let outcome = run(&settings, &cfg, &net, &grafana_net);
-    let _ = std::fs::remove_file(&jar);
+    drop(headers);
     report::print(&outcome);
     Ok(outcome.exit_code())
 }
@@ -347,21 +396,22 @@ mod tests {
         assert_eq!(parse_sources("prometheus,loki,grafana").unwrap().len(), 3);
     }
 
-    /// THE JAR CARRIES A GRAFANA SESSION COOKIE and lands in a directory
-    /// everyone can write to. Left to curl it would be created under whatever
-    /// umask happens to be in effect -- 0644 on a default login shell.
+    /// THE HEADER FILE CARRIES THE TOKEN and lands in a directory everyone
+    /// can write to: 0600 from the first byte.
     #[test]
-    fn the_cookie_jar_is_created_unreadable_to_others() {
+    fn a_private_file_is_created_unreadable_to_others() {
         use std::os::unix::fs::PermissionsExt;
-        let p =
-            std::env::temp_dir().join(format!("crosshair-jar-mode-{}.cookies", std::process::id()));
+        let p = std::env::temp_dir().join(format!(
+            "crosshair-private-mode-{}.headers",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&p);
-        create_cookie_jar(&p).unwrap();
+        create_private(&p, "x").unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         let _ = std::fs::remove_file(&p);
         assert_eq!(
             mode, 0o600,
-            "the cookie jar is readable by others: {mode:o}"
+            "the header file is readable by others: {mode:o}"
         );
     }
 
@@ -369,14 +419,43 @@ mod tests {
     /// whatever it is -- a symlink planted under a predictable name is the
     /// classic temp-file trap.
     #[test]
-    fn an_existing_jar_is_refused_not_overwritten() {
+    fn an_existing_file_is_refused_not_overwritten() {
         let p = std::env::temp_dir().join(format!(
-            "crosshair-jar-exists-{}.cookies",
+            "crosshair-private-exists-{}.headers",
             std::process::id()
         ));
         std::fs::write(&p, "").unwrap();
-        let r = create_cookie_jar(&p);
+        let r = create_private(&p, "x");
         let _ = std::fs::remove_file(&p);
-        assert!(r.is_err(), "an existing jar must not be reused");
+        assert!(r.is_err(), "an existing file must not be reused");
+    }
+
+    /// `echo glsa_… > file` writes a newline; so does every editor.
+    #[test]
+    fn one_trailing_newline_is_tolerated() {
+        assert_eq!(read_token("glsa_abc\n").unwrap(), "glsa_abc");
+        assert_eq!(read_token("glsa_abc\r\n").unwrap(), "glsa_abc");
+        assert_eq!(read_token("glsa_abc").unwrap(), "glsa_abc");
+    }
+
+    #[test]
+    fn an_empty_token_file_is_an_error() {
+        assert!(read_token("").is_err());
+        assert!(read_token("\n").is_err());
+    }
+
+    /// A SECOND LINE WOULD BE A SECOND HEADER in the file curl reads.
+    #[test]
+    fn a_token_with_a_second_line_or_a_space_is_refused() {
+        assert!(read_token("glsa_abc\nX-Evil: 1\n").is_err());
+        assert!(read_token("glsa_abc\n\n").is_err());
+        assert!(read_token("glsa abc").is_err());
+    }
+
+    /// AND THE REFUSAL DOES NOT QUOTE WHAT IT REFUSED.
+    #[test]
+    fn a_refused_token_is_not_in_the_error() {
+        let e = read_token("glsa_geheim wert\n").unwrap_err();
+        assert!(!format!("{e:#}").contains("geheim"), "{e:#}");
     }
 }

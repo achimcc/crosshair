@@ -70,13 +70,27 @@ impl Prometheus<'_> {
         Ok(v["data"].as_array().context("no data array")?.len())
     }
 
-    pub fn control(&self, start: i64, end: i64) -> Result<()> {
-        if self.series(CONTROL_HIT, start, end)? == 0 {
+    /// `up` must hit in BOTH windows, the invented job in neither.
+    ///
+    /// WHY THE SHORT WINDOW TOO (audit B138 / CD-10): asked over the long
+    /// window alone, `up` still has seven days of series on an instance that
+    /// stopped ingesting yesterday. The control passed, and every selector
+    /// then came back `quiet` — hit in the long window, nothing in the short
+    /// one — which is a hint and never changes the exit code. A Prometheus
+    /// that has gone deaf read as a calm week. `quiet` is only a statement
+    /// about a selector if the instance itself is live in the short window.
+    pub fn control(&self, long_start: i64, short_start: i64, end: i64) -> Result<()> {
+        if self.series(CONTROL_HIT, long_start, end)? == 0 {
             bail!(
                 "control: `{CONTROL_HIT}` matched nothing — this run says NOTHING about the rules"
             );
         }
-        if self.series(CONTROL_MISS, start, end)? != 0 {
+        if self.series(CONTROL_HIT, short_start, end)? == 0 {
+            bail!(
+                "control: `{CONTROL_HIT}` matched nothing in the short window — the instance is not ingesting, and every `quiet` verdict of this run would be its artefact"
+            );
+        }
+        if self.series(CONTROL_MISS, long_start, end)? != 0 {
             bail!("control: `{CONTROL_MISS}` matched although it cannot exist");
         }
         Ok(())
@@ -219,7 +233,7 @@ mod tests {
             http: &h,
             base: "http://x:9090".into(),
         };
-        assert!(p.control(0, 1).is_ok());
+        assert!(p.control(0, 0, 1).is_ok());
     }
 
     /// An instance that answers `data: []` to EVERYTHING must fail the control
@@ -231,7 +245,7 @@ mod tests {
             http: &h,
             base: "http://x:9090".into(),
         };
-        assert!(p.control(0, 1).is_err());
+        assert!(p.control(0, 0, 1).is_err());
     }
 
     /// And the other direction: an instance that answers "hit" to everything
@@ -246,6 +260,6 @@ mod tests {
             http: &h,
             base: "http://x:9090".into(),
         };
-        assert!(p.control(0, 1).is_err());
+        assert!(p.control(0, 0, 1).is_err());
     }
 }

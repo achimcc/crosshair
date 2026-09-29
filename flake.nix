@@ -21,6 +21,9 @@
           version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
+          # tests/auth.rs drives the built binary against a local listener and
+          # reads the Authorization header off the wire; the binary calls curl.
+          nativeCheckInputs = [ pkgs.curl ];
           meta = {
             description = "Does this rule point at anything real? Puts every selector of an alerting rule or dashboard panel to the running instance";
             homepage = "https://github.com/achimcc/crosshair";
