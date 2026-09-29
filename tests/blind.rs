@@ -427,3 +427,54 @@ fn an_instance_with_up_only_in_the_long_window_is_a_tool_failure() {
         "a deaf instance must not look like a quiet week"
     );
 }
+
+/// THE SAME HOLE ON LOKI (audit B138 / CD-10): the journal stream asked over
+/// the long window only still answers after Loki has stopped receiving lines.
+/// Every stream selector then came back `quiet`, and the run exited 0.
+///
+/// In nanoseconds: the long window starts at 395200e9, the short one at
+/// 999100e9.
+#[test]
+fn a_loki_with_the_journal_only_in_the_long_window_is_a_tool_failure() {
+    let rules = std::env::temp_dir().join(format!(
+        "crosshair-blind-loki-short-{}.yml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &rules,
+        "groups:\n  - name: g\n    rules:\n      - alert: Verstummt\n        expr: count_over_time({gast=\"stumm\"} [15m]) > 0\n",
+    )
+    .unwrap();
+    let h = Canned::new(vec![
+        (
+            "crosshair-control-no-such-job",
+            r#"{"status":"success","data":[]}"#,
+        ),
+        (
+            "start=395200000000000",
+            r#"{"status":"success","data":[{"job":"systemd-journal","gast":"stumm"}]}"#,
+        ),
+        ("start=999100000000000", r#"{"status":"success","data":[]}"#),
+        (
+            "query_range",
+            r#"{"status":"success","data":{"result":[]}}"#,
+        ),
+    ]);
+    let mut s = settings_for(&["loki"]);
+    s.loki_rules = Some(rules.clone());
+    let o = run(&s, &Config::default(), &h, &h);
+    let _ = std::fs::remove_file(&rules);
+    assert!(
+        o.tool_failures
+            .iter()
+            .any(|t| t.contains("control") && t.contains("short window")),
+        "a Loki with the journal only in the long window must fail the control: {:?} / checks {:?}",
+        o.tool_failures,
+        o.checks
+    );
+    assert_eq!(
+        o.exit_code(),
+        2,
+        "a deaf Loki must not look like a quiet week"
+    );
+}

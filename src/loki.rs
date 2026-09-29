@@ -122,13 +122,26 @@ impl Loki<'_> {
         }
     }
 
-    pub fn control(&self, start_ns: i64, end_ns: i64) -> Result<()> {
-        if self.series(CONTROL_HIT, start_ns, end_ns)? == 0 {
+    /// The journal stream must hit in BOTH windows, the invented job in
+    /// neither.
+    ///
+    /// WHY THE SHORT WINDOW TOO — the same hole `Prometheus::control` had
+    /// (audit B138 / CD-10): over the long window alone, a Loki that stopped
+    /// receiving lines yesterday still shows seven days of the journal stream.
+    /// The control passed, every stream selector came back `quiet`, and
+    /// `quiet` changes no exit code — a deaf Loki read as a calm week.
+    pub fn control(&self, long_start_ns: i64, short_start_ns: i64, end_ns: i64) -> Result<()> {
+        if self.series(CONTROL_HIT, long_start_ns, end_ns)? == 0 {
             bail!(
                 "control: `{CONTROL_HIT}` matched nothing — this run says NOTHING about the rules"
             );
         }
-        if self.series(CONTROL_MISS, start_ns, end_ns)? != 0 {
+        if self.series(CONTROL_HIT, short_start_ns, end_ns)? == 0 {
+            bail!(
+                "control: `{CONTROL_HIT}` matched nothing in the short window — the instance is not ingesting, and every `quiet` verdict of this run would be its artefact"
+            );
+        }
+        if self.series(CONTROL_MISS, long_start_ns, end_ns)? != 0 {
             bail!("control: `{CONTROL_MISS}` matched although it cannot exist");
         }
         Ok(())
@@ -340,7 +353,7 @@ groups:
             http: &h,
             base: "http://x:3100".into(),
         };
-        assert!(l.control(0, 1).is_err());
+        assert!(l.control(0, 0, 1).is_err());
     }
 
     /// And the other direction, the one that is much easier to overlook: an
@@ -357,6 +370,6 @@ groups:
             http: &h,
             base: "http://x:3100".into(),
         };
-        assert!(l.control(0, 1).is_err());
+        assert!(l.control(0, 0, 1).is_err());
     }
 }

@@ -72,11 +72,12 @@ touching any real selector, crosshair asks each source two of its own:
   Loki),
 - one that must not (a label value invented for this purpose).
 
-On Prometheus, `up` must match in **both** windows. Asked over the long
-window alone, an instance that stopped ingesting yesterday still has seven
-days of `up` to show; the control passed, every selector came back `quiet`,
-and `quiet` changes no exit code — a deaf Prometheus read as a calm week.
-Since 0.2.0 an `up` without series in the short window is a tool failure.
+The one that must match has to match in **both** windows — `up` on
+Prometheus, the journal stream on Loki. Asked over the long window alone, an
+instance that stopped ingesting yesterday still has seven days of it to
+show; the control passed, every selector came back `quiet`, and `quiet`
+changes no exit code — a deaf instance read as a calm week. Since 0.2.0 a
+control that is empty in the short window is a tool failure.
 
 If the first misses or the second hits, the run fails with exit 2 and says
 why, instead of quietly reporting a clean bill of health for a source it

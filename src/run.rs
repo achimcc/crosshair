@@ -235,7 +235,7 @@ fn loki_source(s: &Settings, o: &mut Outcome, net: &dyn Http, long: i64, short: 
         base: s.loki.clone(),
     };
     let ns = 1_000_000_000i64;
-    if let Err(e) = l.control(long * ns, s.now * ns) {
+    if let Err(e) = l.control(long * ns, short * ns, s.now * ns) {
         o.tool_failures.push(format!("loki {e}"));
         return;
     }
