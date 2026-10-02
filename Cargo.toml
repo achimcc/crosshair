@@ -18,5 +18,9 @@ serde_json = "1"
 serde_norway = "0.9.42"
 toml = "0.9"
 
+[lints.rust]
+# No `unsafe` anywhere in this crate, and no `#[allow]` can bring it back.
+unsafe_code = "forbid"
+
 [profile.release]
 lto = true
